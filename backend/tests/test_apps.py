@@ -46,6 +46,28 @@ def test_run_weather_app_with_timeseries_output() -> None:
     assert payload["outputs"]["timeseries"]["weather"]["speed_lines"][0]["values"][0] == 18.0
 
 
+def test_run_weather_app_with_standard_time_header() -> None:
+    csv_bytes = "\n".join(
+        [
+            "W. Europe Standard Time,kt,Wind10m deg,Gust deg,Gust value",
+            "2026-02-01 08:00,18,120,0,24",
+            "2026-02-01 10:00,20,135,0,27",
+        ]
+    ).encode("latin1")
+
+    response = client.post(
+        "/api/apps/weather-app/run",
+        files={"csv_file": ("weather-standard.csv", csv_bytes, "text/csv")},
+        data={"model_name": "UM-Global"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["app_slug"] == "weather-app"
+    assert payload["outputs"]["timeseries"]["timestamps"]
+    assert payload["outputs"]["timeseries"]["weather"]["direction_lines"][0]["values"][1] == 135.0
+
+
 def test_run_routing_figures_with_multipart_upload() -> None:
     csv_bytes = "\n".join(
         [

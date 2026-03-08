@@ -7,9 +7,22 @@ import matplotlib.colors as mcolors
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
+import re
 
 from app.processors.base import UploadedInputFile
 from app.processors.utils import figure_to_data_url
+
+
+TIME_COLUMN_CANDIDATES = [
+    "w. europe daylight time",
+    "w. europe standard time",
+    "timeutc",
+    "time",
+    "timestamp",
+    "date",
+    "datetime",
+    "utc",
+]
 
 
 def _serialize_number(value: Any) -> float | int | None:
@@ -28,16 +41,49 @@ def _as_uploaded_file(value: Any, key: str) -> UploadedInputFile:
     raise ValueError(f"Expected uploaded file for '{key}'.")
 
 
+def _normalize_column_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _pick_time_column(df: pd.DataFrame) -> str | None:
+    columns = list(df.columns)
+    normalized_lookup = {_normalize_column_name(column): column for column in columns}
+
+    for candidate in TIME_COLUMN_CANDIDATES:
+        key = _normalize_column_name(candidate)
+        if key in normalized_lookup:
+            return normalized_lookup[key]
+
+    candidate_keys = [_normalize_column_name(candidate) for candidate in TIME_COLUMN_CANDIDATES]
+    for column in columns:
+        normalized = _normalize_column_name(column)
+        if any(candidate_key in normalized for candidate_key in candidate_keys):
+            return column
+
+    return None
+
+
+def _parse_time_series(series: pd.Series) -> pd.Series:
+    normalized = series.astype(str).str.strip().replace({"": pd.NA})
+    normalized = normalized.str.replace(r"[./]", "-", regex=True)
+
+    parsed = pd.to_datetime(normalized, errors="coerce", dayfirst=True)
+    if parsed.isna().all():
+        parsed = pd.to_datetime(normalized, errors="coerce", dayfirst=False)
+    return parsed
+
+
 def run_weather_app(values: dict[str, Any]) -> dict[str, Any]:
     upload = _as_uploaded_file(values.get("csv_file"), "csv_file")
 
     df = pd.read_csv(BytesIO(upload.data), encoding="latin1")
     df.columns = df.columns.str.replace("°", "deg")
 
-    if "W. Europe Daylight Time" not in df.columns:
-        raise ValueError("CSV must contain the 'W. Europe Daylight Time' column.")
+    time_col = _pick_time_column(df)
+    if time_col is None:
+        raise ValueError("CSV must contain a recognizable time column (for example TimeUTC or timezone-specific time).")
 
-    df["Time"] = pd.to_datetime(df["W. Europe Daylight Time"], errors="coerce")
+    df["Time"] = _parse_time_series(df[time_col])
     df = df.dropna(subset=["Time"])
     if df.empty:
         raise ValueError("The uploaded CSV did not contain any parseable timestamps.")
