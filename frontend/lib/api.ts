@@ -1,7 +1,20 @@
 import { ToolAppDetail, ToolAppSummary } from "@/lib/types";
 
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ?? "http://localhost:8000";
+function normalizeApiBaseUrl(value: string): string {
+  const cleaned = value.trim().replace(/^['"]|['"]$/g, "").replace(/\/$/, "");
+  if (!cleaned) {
+    return "http://localhost:8000";
+  }
+  if (/^https?:\/\//i.test(cleaned)) {
+    return cleaned;
+  }
+  if (cleaned.startsWith("//")) {
+    return `https:${cleaned}`;
+  }
+  return `https://${cleaned}`;
+}
+
+const API_BASE_URL = normalizeApiBaseUrl(process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000");
 
 const fallbackApps: ToolAppSummary[] = [
   {
