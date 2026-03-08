@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+from io import BytesIO
+from typing import Any, Optional
+import xml.etree.ElementTree as ET
+
+import matplotlib.patheffects as pe
+import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon
+import numpy as np
+import pandas as pd
+
+from app.processors.base import UploadedInputFile
+from app.processors.utils import figure_to_data_url
+
+
+def _as_uploaded_file(value: Any, key: str) -> UploadedInputFile:
+    if isinstance(value, UploadedInputFile):
+        return value
+    raise ValueError(f"Expected uploaded file for '{key}'.")
+
+
+def _as_float(value: Any, default: float) -> float:
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def centers_to_edges(centers: np.ndarray) -> np.ndarray:
+    centers = np.asarray(centers, dtype=float)
+    diffs = np.diff(centers)
+    delta = np.median(diffs) if len(diffs) else 1.0
+    return np.concatenate(
+        [
+            [centers[0] - delta / 2],
+            centers[:-1] + diffs / 2,
+            [centers[-1] + delta / 2],
+        ]
+    )
+
+
+def catmull_rom_spline(points: np.ndarray, n_points: int = 35, closed: bool = True) -> np.ndarray:
+    points = np.asarray(points, dtype=float)
+    if len(points) < 4:
+        return points
+
+    if closed:
+        pts = np.vstack([points[-1], points, points[0], points[1]])
+        segment_count = len(points)
+        index_offset = 1
+    else:
+        pts = np.vstack([points[0], points, points[-1]])
+        segment_count = len(points) - 1
+        index_offset = 1
+
+    curves: list[np.ndarray] = []
+    for index in range(segment_count):
+        p0 = pts[index + index_offset - 1]
+        p1 = pts[index + index_offset]
+        p2 = pts[index + index_offset + 1]
+        p3 = pts[index + index_offset + 2]
+
+        t = np.linspace(0, 1, n_points, endpoint=False)
+        t2 = t * t
+        t3 = t2 * t
+
+        a = 2 * p1
+        b = -p0 + p2
+        c = 2 * p0 - 5 * p1 + 4 * p2 - p3
+        d = -p0 + 3 * p1 - 3 * p2 + p3
+
+        curve = 0.5 * (a + np.outer(t, b) + np.outer(t2, c) + np.outer(t3, d))
+        curves.append(curve)
+
+    out = np.vstack(curves)
+    if closed:
+        return np.vstack([out, out[0]])
+    return np.vstack([out, points[-1]])
+
+
+def parse_color(node: Optional[ET.Element], default: tuple[int, int, int] = (0, 0, 0)) -> tuple[float, float, float]:
+    if node is None:
+        return tuple(np.array(default) / 255)
+
+    red = int(node.attrib.get("R", default[0]))
+    green = int(node.attrib.get("G", default[1]))
+    blue = int(node.attrib.get("B", default[2]))
+    return (red / 255, green / 255, blue / 255)
+
+
+def load_routing_matrix(data: bytes) -> pd.DataFrame:
+    raw = pd.read_csv(BytesIO(data), sep=";", header=None)
+    if len(raw) < 9:
+        raise ValueError("Routing matrix CSV is too short to parse.")
+
+    header_parts = str(raw.iloc[7, 0]).split(",")
+    if len(header_parts) < 2:
+        raise ValueError("Could not detect TWA headers in the routing matrix CSV.")
+
+    twa = np.array([int(part) for part in header_parts[1:]], dtype=float)
+
+    rows: list[tuple[float, list[float]]] = []
+    for line in raw.iloc[8:, 0].tolist():
+        tokens = str(line).split(",")
+        try:
+            tws = float(tokens[0])
+        except Exception:
+            break
+
+        values = [float(item) for item in tokens[1 : 1 + len(twa)]]
+        rows.append((tws, values))
+
+    if not rows:
+        raise ValueError("No routing matrix rows could be parsed from the CSV.")
+
+    tws = np.array([row[0] for row in rows], dtype=float)
+    matrix = pd.DataFrame([row[1] for row in rows], index=tws, columns=twa).sort_index()
+    return matrix / matrix.values.sum() * 100.0
+
+
+def load_sails_and_lines(data: bytes) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    root = ET.fromstring(data)
+
+    elements_node = root.find("elements")
+    lines_node = root.find("lines")
+    if elements_node is None or lines_node is None:
+        raise ValueError("XML must contain both 'elements' and 'lines' sections.")
+
+    sails: list[dict[str, Any]] = []
+    for element in elements_node.findall("element"):
+        name = element.attrib.get("name", "")
+        color = parse_color(element.find("colour"))
+        bezier_points = element.find("bezierpoints")
+        if bezier_points is None:
+            continue
+
+        points: list[tuple[float, float]] = []
+        for point in bezier_points.findall("point"):
+            points.append((float(point.attrib["twa"]), float(point.attrib["tws"])))
+
+        if len(points) >= 3:
+            sails.append({"name": name, "pts": np.array(points), "color": color})
+
+    lines: list[dict[str, Any]] = []
+    for line in lines_node.findall("line"):
+        name = line.attrib.get("name", "")
+        color = parse_color(line.find("colour"))
+        line_width_node = line.find("linewidth")
+        line_width = float(line_width_node.attrib.get("val", "2")) if line_width_node is not None else 2.0
+
+        points_node = line.find("bezierpoints")
+        if points_node is None:
+            points_node = line.find("points")
+
+        points = []
+        if points_node is not None:
+            for point in points_node.findall("point"):
+                points.append((float(point.attrib["twa"]), float(point.attrib["tws"])))
+
+        if len(points) >= 2:
+            lines.append(
+                {
+                    "name": name,
+                    "pts": np.array(points),
+                    "color": color,
+                    "lw": line_width,
+                }
+            )
+
+    return sails, lines
+
+
+def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[plt.Figure, dict[str, str]]:
+    pct = load_routing_matrix(matrix_csv)
+    sails, lines = load_sails_and_lines(sail_xml)
+
+    tws_edges = centers_to_edges(pct.index.values)
+    twa_edges = centers_to_edges(pct.columns.values)
+
+    masked = np.ma.masked_where(pct.values < threshold, pct.values)
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad(alpha=0.0)
+
+    vmin = float(masked.min()) if masked.count() else 0.0
+    vmax = float(masked.max()) if masked.count() else 1.0
+    norm = plt.Normalize(vmin=vmin, vmax=vmax)
+
+    fig = plt.figure(figsize=(16, 9))
+    ax = fig.add_subplot(111)
+
+    mesh = ax.pcolormesh(
+        twa_edges,
+        tws_edges,
+        masked,
+        shading="flat",
+        cmap=cmap,
+        norm=norm,
+    )
+
+    ax.set_xlabel("TWA (deg)")
+    ax.set_ylabel("TWS (kt)")
+    ax.set_title("Routing Sail Usage Overlay")
+
+    for sail in sails:
+        smooth = catmull_rom_spline(sail["pts"], n_points=35, closed=True)
+        polygon = Polygon(
+            smooth,
+            closed=True,
+            facecolor=sail["color"],
+            edgecolor=sail["color"],
+            alpha=0.15,
+            linewidth=2,
+        )
+        ax.add_patch(polygon)
+        ax.plot(smooth[:, 0], smooth[:, 1], linewidth=2, color=sail["color"])
+
+    for line in lines:
+        smooth = catmull_rom_spline(line["pts"], n_points=35, closed=False)
+        ax.plot(smooth[:, 0], smooth[:, 1], linewidth=line["lw"], color=line["color"])
+
+    for row_index, tws in enumerate(pct.index.values):
+        for col_index, twa in enumerate(pct.columns.values):
+            value = pct.iat[row_index, col_index]
+            if value < threshold:
+                continue
+
+            rgba = cmap(norm(value))
+            luminance = 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
+            text_color = "white" if luminance < 0.45 else "black"
+
+            text = ax.text(
+                twa,
+                tws,
+                f"{value:.1f}%",
+                ha="center",
+                va="center",
+                fontsize=8,
+                fontweight="bold",
+                color=text_color,
+            )
+            stroke = "black" if text_color == "white" else "white"
+            text.set_path_effects([pe.withStroke(linewidth=2.2, foreground=stroke, alpha=0.8)])
+
+    fig.colorbar(mesh, ax=ax, label="Usage (%)")
+
+    metrics = {
+        "tws_bins": str(len(pct.index)),
+        "twa_bins": str(len(pct.columns)),
+        "sails": str(len(sails)),
+        "lines": str(len(lines)),
+    }
+    return fig, metrics
+
+
+def run_sail_usage_overlay(values: dict[str, Any]) -> dict[str, Any]:
+    matrix_csv = _as_uploaded_file(values.get("matrix_csv"), "matrix_csv")
+    sail_xml = _as_uploaded_file(values.get("sail_xml"), "sail_xml")
+    threshold = _as_float(values.get("threshold"), 0.2)
+
+    figure, metrics = create_plot(matrix_csv.data, sail_xml.data, threshold)
+
+    return {
+        "message": "Sail usage overlay generated.",
+        "summary": "Rendered routing usage heatmap with sail crossover and reef line overlays.",
+        "outputs": {
+            "metrics": [
+                {"label": "TWS bins", "value": metrics["tws_bins"]},
+                {"label": "TWA bins", "value": metrics["twa_bins"]},
+                {"label": "Sails", "value": metrics["sails"]},
+                {"label": "Lines", "value": metrics["lines"]},
+            ],
+            "figures": [
+                {
+                    "title": "Routing Sail Usage Overlay",
+                    "image_data_url": figure_to_data_url(figure),
+                }
+            ],
+            "notes": [
+                f"Cells below {threshold:.2f}% are hidden to keep the plot readable.",
+            ],
+        },
+    }
