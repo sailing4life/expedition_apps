@@ -200,3 +200,60 @@ def test_run_sail_usage_overlay_with_csv_and_xml() -> None:
     payload = response.json()
     assert payload["app_slug"] == "sail-usage-overlay"
     assert payload["outputs"]["figures"]
+
+
+def test_run_sail_usage_overlay_with_new_matrix_format() -> None:
+    csv_bytes = "\n".join(
+        [
+            "33 routes",
+            "First start,21-May-2015 14:00:00 W. Europe Standard Time",
+            "Last start,23-May-2025 14:00:00 W. Europe Standard Time",
+            "",
+            "tws\twa,010,020,030,040",
+            "40.0,0,0,0,0",
+            "20.0,0.6,0.4,0.1,0",
+            "10.0,1.2,0.5,0.2,0",
+            "",
+            "Sails,Hours,%",
+            "?,40.40,100.0",
+        ]
+    ).encode("utf-8")
+
+    xml_bytes = """
+    <root>
+      <elements>
+        <element name="J1">
+          <colour R="255" G="120" B="80" />
+          <bezierpoints>
+            <point twa="35" tws="10" />
+            <point twa="65" tws="18" />
+            <point twa="95" tws="12" />
+          </bezierpoints>
+        </element>
+      </elements>
+      <lines>
+        <line name="Reef 1">
+          <colour R="0" G="80" B="220" />
+          <linewidth val="2" />
+          <bezierpoints>
+            <point twa="45" tws="8" />
+            <point twa="90" tws="22" />
+          </bezierpoints>
+        </line>
+      </lines>
+    </root>
+    """.strip().encode("utf-8")
+
+    response = client.post(
+        "/api/apps/sail-usage-overlay/run",
+        files=[
+            ("matrix_csv", ("routing-matrix-new.csv", csv_bytes, "text/csv")),
+            ("sail_xml", ("sail-plan.xml", xml_bytes, "application/xml")),
+        ],
+        data={"threshold": "0.2"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["app_slug"] == "sail-usage-overlay"
+    assert payload["outputs"]["figures"]

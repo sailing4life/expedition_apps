@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from io import BytesIO
 from typing import Any, Optional
 import xml.etree.ElementTree as ET
+import re
 
 import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
@@ -88,34 +88,97 @@ def parse_color(node: Optional[ET.Element], default: tuple[int, int, int] = (0, 
     return (red / 255, green / 255, blue / 255)
 
 
+def _parse_number(value: str) -> float:
+    cleaned = value.strip().replace("%", "")
+    if not cleaned:
+        raise ValueError("Empty numeric token.")
+    return float(cleaned.replace(",", "."))
+
+
+def _split_matrix_line(line: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[;,]", line) if part.strip()]
+
+
 def load_routing_matrix(data: bytes) -> pd.DataFrame:
-    raw = pd.read_csv(BytesIO(data), sep=";", header=None)
-    if len(raw) < 9:
-        raise ValueError("Routing matrix CSV is too short to parse.")
+    text = data.decode("utf-8", errors="ignore")
+    lines = [line.strip() for line in text.splitlines()]
 
-    header_parts = str(raw.iloc[7, 0]).split(",")
-    if len(header_parts) < 2:
-        raise ValueError("Could not detect TWA headers in the routing matrix CSV.")
+    header_index: int | None = None
+    twa_values: list[float] = []
 
-    twa = np.array([int(part) for part in header_parts[1:]], dtype=float)
+    for index, line in enumerate(lines):
+        if not line:
+            continue
+        tokens = _split_matrix_line(line)
+        if len(tokens) < 3:
+            continue
+        first = tokens[0].lower().replace(" ", "")
+        if "tws" not in first:
+            continue
 
-    rows: list[tuple[float, list[float]]] = []
-    for line in raw.iloc[8:, 0].tolist():
-        tokens = str(line).split(",")
-        try:
-            tws = float(tokens[0])
-        except Exception:
+        numeric_tokens: list[float] = []
+        for token in tokens[1:]:
+            try:
+                numeric_tokens.append(_parse_number(token))
+            except Exception:
+                numeric_tokens = []
+                break
+
+        if len(numeric_tokens) >= 2:
+            header_index = index
+            twa_values = numeric_tokens
             break
 
-        values = [float(item) for item in tokens[1 : 1 + len(twa)]]
+    if header_index is None or not twa_values:
+        raise ValueError("Could not detect TWA headers in the routing matrix CSV.")
+
+    rows: list[tuple[float, list[float]]] = []
+    started = False
+
+    for line in lines[header_index + 1 :]:
+        if not line:
+            if started:
+                break
+            continue
+
+        tokens = _split_matrix_line(line)
+        if len(tokens) < 2:
+            if started:
+                break
+            continue
+
+        try:
+            tws = _parse_number(tokens[0])
+        except Exception:
+            if started:
+                break
+            continue
+
+        started = True
+        values: list[float] = []
+        for col_index in range(len(twa_values)):
+            token_index = col_index + 1
+            if token_index >= len(tokens):
+                values.append(0.0)
+                continue
+            try:
+                values.append(_parse_number(tokens[token_index]))
+            except Exception:
+                values.append(0.0)
+
         rows.append((tws, values))
 
     if not rows:
         raise ValueError("No routing matrix rows could be parsed from the CSV.")
 
     tws = np.array([row[0] for row in rows], dtype=float)
-    matrix = pd.DataFrame([row[1] for row in rows], index=tws, columns=twa).sort_index()
-    return matrix / matrix.values.sum() * 100.0
+    matrix = pd.DataFrame([row[1] for row in rows], index=tws, columns=np.array(twa_values, dtype=float)).sort_index()
+    matrix = matrix.fillna(0.0)
+
+    total = float(matrix.values.sum())
+    if total <= 0:
+        raise ValueError("Routing matrix values sum to zero.")
+    return matrix / total * 100.0
 
 
 def load_sails_and_lines(data: bytes) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
