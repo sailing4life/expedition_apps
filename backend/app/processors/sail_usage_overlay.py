@@ -6,6 +6,7 @@ import re
 
 import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.patches import Polygon
 import numpy as np
 import pandas as pd
@@ -236,6 +237,8 @@ def load_sails_and_lines(data: bytes) -> tuple[list[dict[str, Any]], list[dict[s
 def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[plt.Figure, dict[str, str]]:
     pct = load_routing_matrix(matrix_csv)
     sails, lines = load_sails_and_lines(sail_xml)
+    row_totals = pct.sum(axis=1)
+    col_totals = pct.sum(axis=0)
 
     tws_edges = centers_to_edges(pct.index.values)
     twa_edges = centers_to_edges(pct.columns.values)
@@ -244,12 +247,28 @@ def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[p
     cmap = plt.get_cmap("viridis").copy()
     cmap.set_bad(alpha=0.0)
 
-    vmin = float(masked.min()) if masked.count() else 0.0
+    vmin = max(0.0, float(threshold))
     vmax = float(masked.max()) if masked.count() else 1.0
+    if vmax <= vmin:
+        vmax = vmin + 1.0
     norm = plt.Normalize(vmin=vmin, vmax=vmax)
 
-    fig = plt.figure(figsize=(16, 9))
-    ax = fig.add_subplot(111)
+    fig = plt.figure(figsize=(19, 11))
+    grid = fig.add_gridspec(
+        nrows=2,
+        ncols=4,
+        height_ratios=[2.2, 14],
+        width_ratios=[15, 3.4, 2.8, 0.5],
+        hspace=0.15,
+        wspace=0.08,
+    )
+
+    ax_top = fig.add_subplot(grid[0, 0])
+    ax = fig.add_subplot(grid[1, 0], sharex=ax_top)
+    ax_legend = fig.add_subplot(grid[1, 1])
+    ax_right = fig.add_subplot(grid[1, 2], sharey=ax)
+    ax_colorbar = fig.add_subplot(grid[1, 3])
+    ax_legend.axis("off")
 
     mesh = ax.pcolormesh(
         twa_edges,
@@ -260,10 +279,44 @@ def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[p
         norm=norm,
     )
 
+    top_mesh = ax_top.pcolormesh(
+        twa_edges,
+        np.array([0.0, 1.0]),
+        col_totals.values.reshape(1, -1),
+        shading="flat",
+        cmap=cmap,
+        norm=norm,
+    )
+    _ = top_mesh  # keep style consistency for potential future legend hooks
+
+    right_mesh = ax_right.pcolormesh(
+        np.array([0.0, 1.0]),
+        tws_edges,
+        row_totals.values.reshape(-1, 1),
+        shading="flat",
+        cmap=cmap,
+        norm=norm,
+    )
+    _ = right_mesh
+
     ax.set_xlabel("TWA (deg)")
     ax.set_ylabel("TWS (kt)")
-    ax.set_title("Routing Sail Usage Overlay")
+    ax.set_title(
+        "Routing usage heatmap with smooth sail areas + reef lines\n"
+        f"Visible cells: >= {threshold:.2f}% of total time"
+    )
+    ax.grid(True, color="#d1d5db", alpha=0.35, linewidth=0.9)
 
+    ax_top.set_ylabel("TWA %", rotation=0, labelpad=30, va="center", fontsize=12)
+    ax_top.set_yticks([])
+    ax_top.tick_params(axis="x", labelbottom=False)
+    ax_top.set_xlim(twa_edges[0], twa_edges[-1])
+
+    ax_right.set_xlabel("TWS %", fontsize=12)
+    ax_right.set_xticks([])
+    ax_right.tick_params(axis="y", labelleft=False)
+
+    legend_handles: list[Line2D] = []
     for sail in sails:
         smooth = catmull_rom_spline(sail["pts"], n_points=35, closed=True)
         polygon = Polygon(
@@ -276,10 +329,38 @@ def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[p
         )
         ax.add_patch(polygon)
         ax.plot(smooth[:, 0], smooth[:, 1], linewidth=2, color=sail["color"])
+        sail_name = sail["name"] or "Sail"
+        legend_handles.append(Line2D([0], [0], color=sail["color"], linewidth=3, label=sail_name))
+        centroid = np.mean(sail["pts"], axis=0)
+        sail_label = ax.text(
+            float(centroid[0]),
+            float(centroid[1]),
+            sail_name,
+            fontsize=11,
+            fontweight="bold",
+            color="#111827",
+            ha="center",
+            va="center",
+        )
+        sail_label.set_path_effects([pe.withStroke(linewidth=2.6, foreground="white", alpha=0.95)])
 
     for line in lines:
         smooth = catmull_rom_spline(line["pts"], n_points=35, closed=False)
         ax.plot(smooth[:, 0], smooth[:, 1], linewidth=line["lw"], color=line["color"])
+        line_name = line["name"] or "Reef line"
+        legend_handles.append(Line2D([0], [0], color=line["color"], linewidth=max(2, line["lw"]), label=line_name))
+        mid_index = len(smooth) // 2
+        reef_label = ax.text(
+            float(smooth[mid_index, 0]),
+            float(smooth[mid_index, 1]),
+            line_name,
+            fontsize=11,
+            fontweight="bold",
+            color="#111827",
+            ha="center",
+            va="center",
+        )
+        reef_label.set_path_effects([pe.withStroke(linewidth=2.6, foreground="white", alpha=0.95)])
 
     for row_index, tws in enumerate(pct.index.values):
         for col_index, twa in enumerate(pct.columns.values):
@@ -304,7 +385,58 @@ def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[p
             stroke = "black" if text_color == "white" else "white"
             text.set_path_effects([pe.withStroke(linewidth=2.2, foreground=stroke, alpha=0.8)])
 
-    fig.colorbar(mesh, ax=ax, label="Usage (%)")
+    for col_index, twa in enumerate(pct.columns.values):
+        value = float(col_totals.iat[col_index])
+        rgba = cmap(norm(value))
+        luminance = 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
+        text_color = "white" if luminance < 0.45 else "black"
+        top_text = ax_top.text(
+            float(twa),
+            0.5,
+            f"{value:.1f}",
+            ha="center",
+            va="center",
+            fontsize=10,
+            fontweight="bold",
+            color=text_color,
+        )
+        stroke = "black" if text_color == "white" else "white"
+        top_text.set_path_effects([pe.withStroke(linewidth=2.0, foreground=stroke, alpha=0.8)])
+
+    for row_index, tws in enumerate(pct.index.values):
+        value = float(row_totals.iat[row_index])
+        rgba = cmap(norm(value))
+        luminance = 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
+        text_color = "white" if luminance < 0.45 else "black"
+        right_text = ax_right.text(
+            0.5,
+            float(tws),
+            f"{value:.1f}",
+            ha="center",
+            va="center",
+            fontsize=10,
+            fontweight="bold",
+            color=text_color,
+        )
+        stroke = "black" if text_color == "white" else "white"
+        right_text.set_path_effects([pe.withStroke(linewidth=2.0, foreground=stroke, alpha=0.8)])
+
+    if legend_handles:
+        deduped_handles: dict[str, Line2D] = {}
+        for handle in legend_handles:
+            deduped_handles[handle.get_label()] = handle
+        ax_legend.legend(
+            list(deduped_handles.values()),
+            list(deduped_handles.keys()),
+            title="Sails / Reef",
+            loc="upper left",
+            frameon=True,
+            fontsize=12,
+            title_fontsize=13,
+        )
+
+    fig.colorbar(mesh, cax=ax_colorbar, label="% of total time (Visible cells)")
+    fig.tight_layout()
 
     metrics = {
         "tws_bins": str(len(pct.index)),
