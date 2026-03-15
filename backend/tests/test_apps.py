@@ -208,6 +208,12 @@ def test_run_sail_usage_overlay_with_new_matrix_format() -> None:
             "33 routes",
             "First start,21-May-2015 14:00:00 W. Europe Standard Time",
             "Last start,23-May-2025 14:00:00 W. Europe Standard Time",
+            "Min time,1d 06h 50m 40s",
+            "Mean time,1d 16h 23m 53s",
+            "Max time,2d 12h 47m 56s",
+            "Min distance,243.64nm",
+            "Mean distance,258.79nm",
+            "Max distance,279.49nm",
             "",
             "tws\twa,010,020,030,040",
             "40.0,0,0,0,0",
@@ -257,3 +263,8 @@ def test_run_sail_usage_overlay_with_new_matrix_format() -> None:
     payload = response.json()
     assert payload["app_slug"] == "sail-usage-overlay"
     assert payload["outputs"]["figures"]
+    metrics = {item["label"]: item["value"] for item in payload["outputs"]["metrics"]}
+    assert metrics["Mean time"] == "1d 16h 23m 53s"
+    assert metrics["Min distance"] == "243.64nm"
+    assert metrics["Mean distance"] == "258.79nm"
+    assert metrics["Max distance"] == "279.49nm"

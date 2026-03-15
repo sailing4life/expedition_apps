@@ -100,9 +100,35 @@ def _split_matrix_line(line: str) -> list[str]:
     return [part.strip() for part in re.split(r"[;,]", line) if part.strip()]
 
 
-def load_routing_matrix(data: bytes) -> pd.DataFrame:
+def _extract_route_statistics(lines: list[str]) -> dict[str, str]:
+    stats: dict[str, str] = {}
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.match(r"^\s*tws", line, flags=re.IGNORECASE):
+            break
+
+        match = re.match(
+            r"^\s*(min|mean|max)\s+(time|distance)\s*[:;,]?\s*(.+?)\s*$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            continue
+
+        key = f"{match.group(1).lower()}_{match.group(2).lower()}"
+        value = re.sub(r"\s+", " ", match.group(3)).strip()
+        if value:
+            stats[key] = value
+
+    return stats
+
+
+def load_routing_matrix(data: bytes) -> tuple[pd.DataFrame, dict[str, str]]:
     text = data.decode("utf-8", errors="ignore")
     lines = [line.strip() for line in text.splitlines()]
+    route_stats = _extract_route_statistics(lines)
 
     header_index: int | None = None
     twa_values: list[float] = []
@@ -179,7 +205,7 @@ def load_routing_matrix(data: bytes) -> pd.DataFrame:
     total = float(matrix.values.sum())
     if total <= 0:
         raise ValueError("Routing matrix values sum to zero.")
-    return matrix / total * 100.0
+    return matrix / total * 100.0, route_stats
 
 
 def load_sails_and_lines(data: bytes) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -235,7 +261,7 @@ def load_sails_and_lines(data: bytes) -> tuple[list[dict[str, Any]], list[dict[s
 
 
 def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[plt.Figure, dict[str, str]]:
-    pct = load_routing_matrix(matrix_csv)
+    pct, route_stats = load_routing_matrix(matrix_csv)
     sails, lines = load_sails_and_lines(sail_xml)
     row_totals = pct.sum(axis=1)
     col_totals = pct.sum(axis=0)
@@ -247,11 +273,21 @@ def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[p
     cmap = plt.get_cmap("viridis").copy()
     cmap.set_bad(alpha=0.0)
 
-    vmin = max(0.0, float(threshold))
-    vmax = float(masked.max()) if masked.count() else 1.0
-    if vmax <= vmin:
-        vmax = vmin + 1.0
-    norm = plt.Normalize(vmin=vmin, vmax=vmax)
+    main_vmin = max(0.0, float(threshold))
+    main_vmax = float(masked.max()) if masked.count() else 1.0
+    if main_vmax <= main_vmin:
+        main_vmax = main_vmin + 1.0
+    norm_main = plt.Normalize(vmin=main_vmin, vmax=main_vmax)
+
+    top_vmax = float(col_totals.max()) if len(col_totals) else 1.0
+    if top_vmax <= 0:
+        top_vmax = 1.0
+    norm_top = plt.Normalize(vmin=0.0, vmax=top_vmax)
+
+    right_vmax = float(row_totals.max()) if len(row_totals) else 1.0
+    if right_vmax <= 0:
+        right_vmax = 1.0
+    norm_right = plt.Normalize(vmin=0.0, vmax=right_vmax)
 
     fig = plt.figure(figsize=(19, 11))
     grid = fig.add_gridspec(
@@ -276,7 +312,7 @@ def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[p
         masked,
         shading="flat",
         cmap=cmap,
-        norm=norm,
+        norm=norm_main,
     )
 
     top_mesh = ax_top.pcolormesh(
@@ -285,7 +321,7 @@ def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[p
         col_totals.values.reshape(1, -1),
         shading="flat",
         cmap=cmap,
-        norm=norm,
+        norm=norm_top,
     )
     _ = top_mesh  # keep style consistency for potential future legend hooks
 
@@ -295,7 +331,7 @@ def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[p
         row_totals.values.reshape(-1, 1),
         shading="flat",
         cmap=cmap,
-        norm=norm,
+        norm=norm_right,
     )
     _ = right_mesh
 
@@ -368,7 +404,7 @@ def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[p
             if value < threshold:
                 continue
 
-            rgba = cmap(norm(value))
+            rgba = cmap(norm_main(value))
             luminance = 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
             text_color = "white" if luminance < 0.45 else "black"
 
@@ -387,7 +423,7 @@ def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[p
 
     for col_index, twa in enumerate(pct.columns.values):
         value = float(col_totals.iat[col_index])
-        rgba = cmap(norm(value))
+        rgba = cmap(norm_top(value))
         luminance = 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
         text_color = "white" if luminance < 0.45 else "black"
         top_text = ax_top.text(
@@ -405,7 +441,7 @@ def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[p
 
     for row_index, tws in enumerate(pct.index.values):
         value = float(row_totals.iat[row_index])
-        rgba = cmap(norm(value))
+        rgba = cmap(norm_right(value))
         luminance = 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
         text_color = "white" if luminance < 0.45 else "black"
         right_text = ax_right.text(
@@ -444,6 +480,10 @@ def create_plot(matrix_csv: bytes, sail_xml: bytes, threshold: float) -> tuple[p
         "sails": str(len(sails)),
         "lines": str(len(lines)),
     }
+    for key in ("min_time", "mean_time", "max_time", "min_distance", "mean_distance", "max_distance"):
+        value = route_stats.get(key)
+        if value:
+            metrics[key] = value
     return fig, metrics
 
 
@@ -454,16 +494,31 @@ def run_sail_usage_overlay(values: dict[str, Any]) -> dict[str, Any]:
 
     figure, metrics = create_plot(matrix_csv.data, sail_xml.data, threshold)
 
+    metrics_output = [
+        {"label": "TWS bins", "value": metrics["tws_bins"]},
+        {"label": "TWA bins", "value": metrics["twa_bins"]},
+        {"label": "Sails", "value": metrics["sails"]},
+        {"label": "Lines", "value": metrics["lines"]},
+    ]
+
+    optional_metric_labels = [
+        ("min_time", "Min time"),
+        ("mean_time", "Mean time"),
+        ("max_time", "Max time"),
+        ("min_distance", "Min distance"),
+        ("mean_distance", "Mean distance"),
+        ("max_distance", "Max distance"),
+    ]
+    for key, label in optional_metric_labels:
+        value = metrics.get(key)
+        if value:
+            metrics_output.append({"label": label, "value": value})
+
     return {
         "message": "Sail usage overlay generated.",
         "summary": "Rendered routing usage heatmap with sail crossover and reef line overlays.",
         "outputs": {
-            "metrics": [
-                {"label": "TWS bins", "value": metrics["tws_bins"]},
-                {"label": "TWA bins", "value": metrics["twa_bins"]},
-                {"label": "Sails", "value": metrics["sails"]},
-                {"label": "Lines", "value": metrics["lines"]},
-            ],
+            "metrics": metrics_output,
             "figures": [
                 {
                     "title": "Routing Sail Usage Overlay",
